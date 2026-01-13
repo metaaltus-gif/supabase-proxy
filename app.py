@@ -1,144 +1,132 @@
-#!/usr/bin/env python3
-"""
-SUPABASE PROXY API
-Deploy em Railway, Render ou qualquer servidor Python
-
-Este proxy permite executar SQL no Supabase de qualquer lugar!
-"""
-
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
-from functools import wraps
+from urllib.parse import urlparse, urlunparse
+import socket
 
 app = Flask(__name__)
-CORS(app)
 
-# Configuração via variáveis de ambiente
-DATABASE_URL = os.getenv('DATABASE_URL')
-API_KEY = os.getenv('API_KEY', 'sua-chave-secreta-aqui')
+# Configuração
+API_KEY = os.environ.get('API_KEY', 'change-me')
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
-def require_api_key(f):
-    """Decorator para proteger endpoints com API Key"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        key = request.headers.get('X-API-Key')
-        if key != API_KEY:
-            return jsonify({'error': 'Unauthorized'}), 401
-        return f(*args, **kwargs)
-    return decorated_function
+def get_ipv4_connection_string(url):
+    """Converte hostname para IPv4 para evitar problemas de IPv6"""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    
+    try:
+        # Resolver hostname para IPv4
+        ipv4 = socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
+        # Substituir hostname por IP
+        netloc = parsed.netloc.replace(hostname, ipv4)
+        new_parsed = parsed._replace(netloc=netloc)
+        return urlunparse(new_parsed)
+    except:
+        return url
+
+def get_db_connection():
+    """Cria conexão com banco usando IPv4"""
+    conn_string = get_ipv4_connection_string(DATABASE_URL)
+    return psycopg2.connect(conn_string)
+
+def verify_api_key():
+    """Verifica API Key"""
+    key = request.headers.get('X-API-Key')
+    if key != API_KEY:
+        return jsonify({'error': 'Unauthorized'}), 401
+    return None
 
 @app.route('/')
-def home():
+def index():
     return jsonify({
-        'service': 'Supabase Proxy API',
-        'status': 'running',
+        'name': 'Supabase Proxy API',
         'version': '1.0',
-        'endpoints': {
-            '/execute': 'POST - Execute SQL',
-            '/query': 'POST - Execute SELECT query',
-            '/health': 'GET - Health check'
-        }
+        'endpoints': ['/health', '/execute', '/query', '/batch']
     })
 
 @app.route('/health')
 def health():
-    """Health check para Railway/Render"""
+    """Health check com teste de conexão"""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT version();')
+        version = cursor.fetchone()[0]
+        cursor.close()
         conn.close()
-        return jsonify({'status': 'healthy', 'database': 'connected'})
+        
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'version': version[:50]
+        })
     except Exception as e:
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
 
 @app.route('/execute', methods=['POST'])
-@require_api_key
 def execute_sql():
-    """
-    Executa SQL (CREATE, INSERT, UPDATE, DELETE)
+    """Executa SQL (CREATE, INSERT, UPDATE, DELETE)"""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
     
-    Body:
-    {
-        "sql": "CREATE TABLE..."
-    }
-    """
+    data = request.get_json()
+    sql = data.get('sql')
+    
+    if not sql:
+        return jsonify({'error': 'SQL query required'}), 400
+    
     try:
-        data = request.get_json()
-        sql = data.get('sql')
-        
-        if not sql:
-            return jsonify({'error': 'SQL is required'}), 400
-        
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection()
         conn.autocommit = False
         cursor = conn.cursor()
         
-        # Executar SQL
         cursor.execute(sql)
         conn.commit()
-        
-        # Pegar mensagens (se houver)
-        messages = []
-        if cursor.statusmessage:
-            messages.append(cursor.statusmessage)
         
         cursor.close()
         conn.close()
         
         return jsonify({
             'status': 'success',
-            'messages': messages,
-            'rows_affected': cursor.rowcount
+            'message': 'SQL executed successfully'
         })
-        
     except Exception as e:
         if 'conn' in locals():
             conn.rollback()
-            conn.close()
         return jsonify({
             'status': 'error',
-            'error': str(e),
-            'type': type(e).__name__
-        }), 400
+            'error': str(e)
+        }), 500
 
 @app.route('/query', methods=['POST'])
-@require_api_key
 def query_sql():
-    """
-    Executa SELECT query e retorna resultados
+    """Executa SELECT e retorna resultados"""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
     
-    Body:
-    {
-        "sql": "SELECT * FROM...",
-        "params": [] (opcional)
-    }
-    """
+    data = request.get_json()
+    sql = data.get('sql')
+    
+    if not sql:
+        return jsonify({'error': 'SQL query required'}), 400
+    
     try:
-        data = request.get_json()
-        sql = data.get('sql')
-        params = data.get('params', None)
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        if not sql:
-            return jsonify({'error': 'SQL is required'}), 400
-        
-        conn = psycopg2.connect(DATABASE_URL)
-        cursor = conn.cursor()
-        
-        # Executar query
-        if params:
-            cursor.execute(sql, params)
-        else:
-            cursor.execute(sql)
-        
-        # Pegar resultados
-        columns = [desc[0] for desc in cursor.description] if cursor.description else []
-        rows = cursor.fetchall()
-        
-        # Converter para dicionários
-        results = []
-        for row in rows:
-            results.append(dict(zip(columns, row)))
+        cursor.execute(sql)
+        results = cursor.fetchall()
         
         cursor.close()
         conn.close()
@@ -148,46 +136,32 @@ def query_sql():
             'data': results,
             'count': len(results)
         })
-        
     except Exception as e:
-        if 'conn' in locals():
-            conn.close()
         return jsonify({
             'status': 'error',
-            'error': str(e),
-            'type': type(e).__name__
-        }), 400
+            'error': str(e)
+        }), 500
 
 @app.route('/batch', methods=['POST'])
-@require_api_key
-def batch_execute():
-    """
-    Executa múltiplos SQLs em transação
+def batch_sql():
+    """Executa múltiplos SQLs em transação"""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
     
-    Body:
-    {
-        "sqls": ["SQL1", "SQL2", ...]
-    }
-    """
+    data = request.get_json()
+    sqls = data.get('sqls', [])
+    
+    if not sqls:
+        return jsonify({'error': 'SQL queries required'}), 400
+    
     try:
-        data = request.get_json()
-        sqls = data.get('sqls', [])
-        
-        if not sqls:
-            return jsonify({'error': 'sqls array is required'}), 400
-        
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection()
         conn.autocommit = False
         cursor = conn.cursor()
         
-        results = []
-        
         for sql in sqls:
             cursor.execute(sql)
-            results.append({
-                'status': 'success',
-                'rows_affected': cursor.rowcount
-            })
         
         conn.commit()
         cursor.close()
@@ -195,20 +169,16 @@ def batch_execute():
         
         return jsonify({
             'status': 'success',
-            'results': results,
-            'total': len(sqls)
+            'message': f'{len(sqls)} queries executed successfully'
         })
-        
     except Exception as e:
         if 'conn' in locals():
             conn.rollback()
-            conn.close()
         return jsonify({
             'status': 'error',
-            'error': str(e),
-            'type': type(e).__name__
-        }), 400
+            'error': str(e)
+        }), 500
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port)
